@@ -1,10 +1,14 @@
 import ipaddress
 import json
+import re
+from pathlib import Path
 import socket
+import time
 from urllib.parse import urlsplit
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 MAX_DESCRIPTION_CHARS = 24000
+SCREENSHOT_DIR = Path("./data/screenshots")
 MAX_REQUIREMENTS = 40
 NAVIGATION_TIMEOUT_MS = 25000
 
@@ -63,6 +67,71 @@ def _clean(value) -> str:
     return " ".join(str(value).split()).strip()
 
 
+def normalize_salary(raw: str, description: str = "") -> dict:
+    """Parse common JobPosting baseSalary JSON-LD without discarding the source value."""
+    result = {"salary_min": None, "salary_max": None, "salary_currency": "", "salary_period": ""}
+    if raw:
+        try:
+            value = json.loads(raw)
+            if isinstance(value, dict):
+                result["salary_currency"] = str(value.get("currency") or "").upper()
+                amount = value.get("value", value)
+                if isinstance(amount, dict):
+                    result["salary_min"] = _number(amount.get("minValue", amount.get("value")))
+                    result["salary_max"] = _number(amount.get("maxValue", amount.get("value")))
+                    unit = amount.get("unitText") or value.get("unitText") or ""
+                    result["salary_period"] = _period(unit)
+                if not result["salary_currency"]:
+                    result["salary_currency"] = str(value.get("currencyCode") or "").upper()
+        except (ValueError, TypeError):
+            pass
+    if result["salary_min"] is None and result["salary_max"] is None:
+        match = re.search(
+            r"(?:₹|INR\s*)\s*([\d,.]+)\s*(L| lakh| lakhs| crore| cr)?\s*(?:-|–|to)\s*(?:₹|INR\s*)?\s*([\d,.]+)\s*(L| lakh| lakhs| crore| cr)?",
+            description,
+            re.I,
+        )
+        if match:
+            def amount(num, unit):
+                number = float(num.replace(",", ""))
+                unit = (unit or "").strip().lower()
+                if unit in {"l", "lakh", "lakhs"}:
+                    number *= 100000
+                elif unit in {"crore", "cr"}:
+                    number *= 10000000
+                return int(number)
+
+            result["salary_min"] = amount(match.group(1), match.group(2))
+            result["salary_max"] = amount(match.group(3), match.group(4) or match.group(2))
+            result["salary_currency"] = "INR"
+            result["salary_period"] = (
+                "YEAR"
+                if re.search(r"/\s*(year|yr|annum)|per\s+year", description, re.I)
+                else ""
+            )
+    return result
+
+
+def _number(value):
+    try:
+        return int(float(value)) if value is not None and value != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _period(value: str) -> str:
+    value = str(value).strip().upper()
+    if value in {"YEAR", "YEARLY", "ANNUAL", "ANNUALLY"}:
+        return "YEAR"
+    if value in {"MONTH", "MONTHLY"}:
+        return "MONTH"
+    if value in {"HOUR", "HOURLY"}:
+        return "HOUR"
+    if value in {"WEEK", "WEEKLY"}:
+        return "WEEK"
+    return value[:20]
+
+
 async def inspect_job_page(url: str) -> dict:
     _assert_public_http_url(url)
     async with async_playwright() as p:
@@ -96,6 +165,9 @@ async def inspect_job_page(url: str) -> dict:
             except PlaywrightTimeoutError:
                 warnings.append("Page did not reach network idle; inspected currently rendered content.")
             await page.wait_for_timeout(350)
+            SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+            job_screenshot = SCREENSHOT_DIR / f"job_{int(time.time() * 1000)}_description.png"
+            await page.screenshot(path=str(job_screenshot), full_page=True, animations="disabled")
 
             payload = await page.evaluate("""() => {
               const text = (el) => (el?.innerText || el?.textContent || '').replace(/\\s+/g, ' ').trim();
@@ -210,6 +282,40 @@ async def inspect_job_page(url: str) -> dict:
             else:
                 requirements_list = requirements if isinstance(requirements, list) else [str(requirements)]
             requirements_list = [_clean(x) for x in requirements_list if _clean(x)][:MAX_REQUIREMENTS]
+
+            # Inspect the first application step only. Never click submit/finalize controls.
+            application_url = ""
+            application_screenshot = ""
+            application_fields = []
+            try:
+                apply_locator = page.locator("a, button, [role='button']").filter(
+                    has_text=re.compile(r"^\s*apply(?:\s+for\s+this\s+job)?\s*$", re.I)
+                ).first
+                if await apply_locator.count() and await apply_locator.is_visible():
+                    before_url = page.url
+                    try:
+                        async with page.expect_navigation(wait_until="domcontentloaded", timeout=5000):
+                            await apply_locator.click(timeout=3000)
+                    except PlaywrightTimeoutError:
+                        await page.wait_for_timeout(800)
+                    if page.url != before_url:
+                        _assert_public_http_url(page.url)
+                    application_url = page.url
+                    application_fields = await page.evaluate("""() => [...document.querySelectorAll('input,textarea,select,[role=combobox]')].slice(0,100).map(el => {
+                      const id = el.id; const label = id ? document.querySelector(`label[for=\"${CSS.escape(id)}\"]`) : null;
+                      return {tag: el.tagName.toLowerCase(), type: el.getAttribute('type') || '', name: el.getAttribute('name') || '', id: id || '', label: (label?.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim(), required: !!el.required || el.getAttribute('aria-required') === 'true'};
+                    })""")
+                    application_screenshot_path = SCREENSHOT_DIR / f"job_{int(time.time() * 1000)}_application.png"
+                    await page.screenshot(path=str(application_screenshot_path), full_page=True, animations="disabled")
+                    application_screenshot = application_screenshot_path.as_posix()
+                else:
+                    warnings.append("No clearly labelled Apply control was found; application flow was not opened.")
+            except Exception as exc:
+                warnings.append(
+                    f"Application flow could not be fully inspected ({type(exc).__name__}); "
+                    "job-page inspection was retained."
+                )
+
             if payload.get("has_captcha"):
                 warnings.append("A CAPTCHA-like element was detected. Manual intervention may be required; it will not be bypassed.")
             if not payload.get("has_application_form"):
@@ -218,6 +324,7 @@ async def inspect_job_page(url: str) -> dict:
                 warnings.append("Could not confidently extract a job title.")
             if not description:
                 warnings.append("Could not extract a job description.")
+            salary = normalize_salary(_clean(payload.get("salary_text")), description)
             return {
                 "inspection_status": "completed",
                 "page_title": _clean(payload.get("page_title"))[:500],
@@ -228,7 +335,12 @@ async def inspect_job_page(url: str) -> dict:
                 "location": _clean(payload.get("location"))[:300],
                 "employment_type": _clean(payload.get("employment_type"))[:120],
                 "work_mode": _clean(payload.get("work_mode"))[:120],
-                "salary_text": _clean(payload.get("salary_text"))[:300],
+                "salary_text": _clean(payload.get("salary_text")),
+                **salary,
+                "job_screenshot_path": job_screenshot.as_posix(),
+                "application_screenshot_path": application_screenshot,
+                "application_url": application_url,
+                "application_fields": application_fields,
                 "description": description[:MAX_DESCRIPTION_CHARS],
                 "requirements": requirements_list,
                 "detected_fields": payload.get("form_fields", []),

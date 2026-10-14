@@ -51,3 +51,13 @@ curl -X POST http://127.0.0.1:8000/api/v1/jobs \
 - Don't store portal passwords or session cookies in plaintext.
 - Only automate portals and interactions permitted by their terms; don't bypass CAPTCHA, MFA, or access controls.
 - Final application submission will require a human review/approval checkpoint in the selected workflow.
+
+## Phase 2.1: salary normalization and screenshots
+
+- Salary JSON-LD is preserved in `salary_text` and normalized into `salary_min`, `salary_max`, `salary_currency`, and `salary_period` when available.
+- Each inspection stores a full-page job-description screenshot under `data/screenshots/`.
+- The inspector attempts to open a clearly labelled **Apply** control (never a submit/finalize control), inventories visible application fields, and saves an application-step screenshot when accessible.
+- Screenshot paths are returned by the inspection API and stored as relative local paths. Keep `data/` out of version control.
+- The startup performs additive SQLite column migration only; it does not delete existing records.
+
+For a fresh browser installation: `python -m playwright install chromium`. Run with `python -m uvicorn app.main:app`.

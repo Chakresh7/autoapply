@@ -1,6 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.config import settings
+from sqlalchemy import inspect, text
 from app.db import Base, engine
 from app import models  # ensures models are registered
 from app.routers import jobs, resumes, inspections
@@ -9,6 +10,25 @@ from app.routers import jobs, resumes, inspections
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    # Small additive migration for existing local SQLite databases. Never drops data.
+    if engine.dialect.name == "sqlite":
+        inspector = inspect(engine)
+        if "job_inspections" in inspector.get_table_names():
+            existing = {col["name"] for col in inspector.get_columns("job_inspections")}
+            additions = {
+                "salary_min": "INTEGER NULL",
+                "salary_max": "INTEGER NULL",
+                "salary_currency": "VARCHAR(8) NOT NULL DEFAULT ''",
+                "salary_period": "VARCHAR(20) NOT NULL DEFAULT ''",
+                "job_screenshot_path": "TEXT NOT NULL DEFAULT ''",
+                "application_screenshot_path": "TEXT NOT NULL DEFAULT ''",
+                "application_url": "TEXT NOT NULL DEFAULT ''",
+                "application_fields_json": "TEXT NOT NULL DEFAULT '[]'",
+            }
+            with engine.begin() as conn:
+                for name, definition in additions.items():
+                    if name not in existing:
+                        conn.execute(text(f"ALTER TABLE job_inspections ADD COLUMN {name} {definition}"))
     yield
 
 
